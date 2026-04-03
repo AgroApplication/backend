@@ -79,7 +79,7 @@ public class ScanService {
                         .build());
 
         String status = diseaseName.equalsIgnoreCase("Healthy") ? "healthy" : "diseased";
-        double affectedArea = status.equals("healthy") ? 0 : Math.random() * 30 + 10;
+        double affectedArea = status.equals("healthy") ? 0 : Math.round((100 - confidence) * 0.6 * 10.0) / 10.0;
 
         // Parse treatments
         List<String> treatments;
@@ -158,7 +158,7 @@ public class ScanService {
     }
 
     private Map<String, Object> getFallbackPrediction(MultipartFile file) {
-        // Validate image locally before returning random prediction
+        // Validate image locally
         try {
             if (!isLikelyLeafImage(file.getBytes())) {
                 Map<String, Object> rejection = new HashMap<>();
@@ -170,16 +170,68 @@ public class ScanService {
             log.warn("Image pre-validation failed, allowing anyway: {}", e.getMessage());
         }
 
-        List<String> diseases = List.of("Rice Blast", "Brown Spot", "Bacterial Leaf Blight", "Sheath Blight", "Healthy");
-        Random random = new Random();
-        String disease = diseases.get(random.nextInt(diseases.size()));
-        double confidence = 60 + random.nextDouble() * 35;
+        // DETERMINISTIC prediction based on actual pixel colors
+        // Same image → same pixels → same result EVERY TIME
+        try {
+            byte[] imageBytes = file.getBytes();
+            BufferedImage img = ImageIO.read(new ByteArrayInputStream(imageBytes));
+            if (img == null) throw new IOException("Cannot read image");
 
-        Map<String, Object> result = new HashMap<>();
-        result.put("isValidLeaf", true);
-        result.put("disease", disease);
-        result.put("confidence", Math.round(confidence * 10.0) / 10.0);
-        return result;
+            int width = img.getWidth();
+            int height = img.getHeight();
+            int step = Math.max(1, Math.min(width, height) / 64);
+
+            int total = 0, greenPx = 0, brownPx = 0, grayPx = 0, darkPx = 0, yellowPx = 0;
+
+            for (int x = 0; x < width; x += step) {
+                for (int y = 0; y < height; y += step) {
+                    int rgb = img.getRGB(x, y);
+                    int r = (rgb >> 16) & 0xFF, g = (rgb >> 8) & 0xFF, b = rgb & 0xFF;
+                    total++;
+                    if (g > r && g > b && g > 60) greenPx++;
+                    if (r > 100 && g > 80 && b < 80 && r > g) brownPx++;
+                    if (Math.abs(r - g) < 20 && Math.abs(g - b) < 20 && r > 100) grayPx++;
+                    if (r < 80 && g < 80 && b < 80) darkPx++;
+                    if (r > 120 && g > 120 && b < 80) yellowPx++;
+                }
+            }
+            if (total == 0) total = 1;
+
+            Map<String, Double> scores = new LinkedHashMap<>();
+            scores.put("Healthy", (double) greenPx / total);
+            scores.put("Brown Spot", (double) brownPx / total);
+            scores.put("Sheath Blight", (double) grayPx / total);
+            scores.put("Rice Blast", (double) darkPx / total);
+            scores.put("Bacterial Leaf Blight", (double) yellowPx / total);
+
+            String best = "Healthy";
+            double bestScore = 0, totalScore = 0;
+            for (Map.Entry<String, Double> e : scores.entrySet()) {
+                totalScore += e.getValue();
+                if (e.getValue() > bestScore) { bestScore = e.getValue(); best = e.getKey(); }
+            }
+
+            double confidence = totalScore > 0 ? Math.min((bestScore / totalScore) * 100, 95.0) : 50.0;
+            confidence = Math.max(confidence, 30.0);
+            confidence = Math.round(confidence * 10.0) / 10.0;
+
+            log.info("Deterministic fallback: {} at {}% confidence", best, confidence);
+
+            Map<String, Object> result = new HashMap<>();
+            result.put("isValidLeaf", true);
+            result.put("disease", best);
+            result.put("confidence", confidence);
+            return result;
+
+        } catch (Exception e) {
+            log.error("Pixel analysis failed: {}", e.getMessage());
+            // Last resort fallback - fixed result, not random
+            Map<String, Object> result = new HashMap<>();
+            result.put("isValidLeaf", true);
+            result.put("disease", "Brown Spot");
+            result.put("confidence", 65.0);
+            return result;
+        }
     }
 
     /**
